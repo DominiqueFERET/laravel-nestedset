@@ -11,6 +11,8 @@ class NodeTest extends PHPUnit_Framework_TestCase
 
         $schema->dropIfExists('categories');
 
+        Capsule::disableQueryLog();
+
         $schema->create('categories', function (\Illuminate\Database\Schema\Blueprint $table) {
             $table->increments('id');
             $table->string('name');
@@ -26,6 +28,8 @@ class NodeTest extends PHPUnit_Framework_TestCase
         $data = include __DIR__.'/data/categories.php';
 
         Capsule::table('categories')->insert($data);
+
+        Capsule::flushQueryLog();
 
         Category::resetActionsPerformed();
 
@@ -103,7 +107,7 @@ class NodeTest extends PHPUnit_Framework_TestCase
     /**
      * @param $name
      *
-     * @return \Kalnoy\Nestedset\Node
+     * @return \Category
      */
     public function findCategory($name, $withTrashed = false)
     {
@@ -289,6 +293,11 @@ class NodeTest extends PHPUnit_Framework_TestCase
 
         $this->assertEquals(count($descendants), $node->getDescendantCount());
         $this->assertEquals($expected, $descendants);
+
+        $descendants = all(Category::descendantsAndSelf(7)->pluck('name'));
+        $expected = [ 'samsung', 'galaxy' ];
+
+        $this->assertEquals($expected, $descendants);
     }
 
     public function testWithDepthWorks()
@@ -322,6 +331,8 @@ class NodeTest extends PHPUnit_Framework_TestCase
 
         $node->parent_id = null;
         $node->save();
+
+        $node->refreshNode();
 
         $this->assertEquals(null, $node->parent_id);
         $this->assertTrue($node->isRoot());
@@ -687,10 +698,25 @@ class NodeTest extends PHPUnit_Framework_TestCase
         $this->assertEquals(null, $node->getParentId());
     }
 
+    public function testSubtreeIsFixed()
+    {
+        Category::where('id', '=', 8)->update([ '_lft' => 11 ]);
+
+        $fixed = Category::fixSubtree(Category::find(5));
+        $this->assertEquals($fixed, 1);
+        $this->assertTreeNotBroken();
+        $this->assertEquals(Category::find(8)->getLft(), 12);
+    }
+
     public function testParentIdDirtiness()
     {
         $node = $this->findCategory('apple');
         $node->parent_id = 5;
+
+        $this->assertTrue($node->isDirty('parent_id'));
+
+        $node = $this->findCategory('apple');
+        $node->parent_id = null;
 
         $this->assertTrue($node->isDirty('parent_id'));
     }
@@ -794,14 +820,38 @@ class NodeTest extends PHPUnit_Framework_TestCase
         $this->assertEquals(3, $node->getParentId());
     }
 
+    public function testRebuildSubtree()
+    {
+        $fixed = Category::rebuildSubtree(Category::find(7), [
+            [ 'name' => 'new node' ],
+            [ 'id' => '8' ],
+        ]);
+
+        echo PHP_EOL.$fixed.PHP_EOL;
+
+        $this->assertTrue($fixed > 0);
+        $this->assertTreeNotBroken();
+
+        $node = $this->findCategory('new node');
+
+        $this->assertNotNull($node);
+        $this->assertEquals($node->getLft(), 12);
+    }
+
     public function testRebuildTreeWithDeletion()
     {
         Category::rebuildTree([ [ 'name' => 'all deleted' ] ], true);
+
+        $this->assertTreeNotBroken();
 
         $nodes = Category::get();
 
         $this->assertEquals(1, $nodes->count());
         $this->assertEquals('all deleted', $nodes->first()->name);
+
+        $nodes = Category::withTrashed()->get();
+
+        $this->assertTrue($nodes->count() > 1);
     }
 
     /**
@@ -836,6 +886,119 @@ class NodeTest extends PHPUnit_Framework_TestCase
 
         $duplicate->saveAsRoot();
     }
+
+    public function testWhereIsLeaf()
+    {
+        $categories = Category::leaves();
+
+        $this->assertEquals(7, $categories->count());
+        $this->assertEquals('apple', $categories->first()->name);
+        $this->assertTrue($categories->first()->isLeaf());
+
+        $category = Category::whereIsRoot()->first();
+
+        $this->assertFalse($category->isLeaf());
+    }
+
+    public function testEagerLoadAncestors()
+    {
+        $queryLogCount = count(Capsule::connection()->getQueryLog());
+        $categories = Category::with('ancestors')->orderBy('name')->get();
+
+        $this->assertEquals($queryLogCount + 2, count(Capsule::connection()->getQueryLog()));
+
+        $expectedShape = [
+            'apple (3)}' => 'store (1) > notebooks (2)',
+            'galaxy (8)}' => 'store (1) > mobile (5) > samsung (7)',
+            'lenovo (4)}' => 'store (1) > notebooks (2)',
+            'lenovo (10)}' => 'store (1) > mobile (5)',
+            'mobile (5)}' => 'store (1)',
+            'nokia (6)}' => 'store (1) > mobile (5)',
+            'notebooks (2)}' => 'store (1)',
+            'samsung (7)}' => 'store (1) > mobile (5)',
+            'sony (9)}' => 'store (1) > mobile (5)',
+            'store (1)}' => '',
+            'store_2 (11)}' => ''
+        ];
+
+        $output = [];
+
+        foreach ($categories as $category) {
+            $output["{$category->name} ({$category->id})}"] = $category->ancestors->count()
+                ? implode(' > ', $category->ancestors->map(function ($cat) { return "{$cat->name} ({$cat->id})"; })->toArray())
+                : '';
+        }
+
+        $this->assertEquals($expectedShape, $output);
+    }
+
+    public function testLazyLoadAncestors()
+    {
+        $queryLogCount = count(Capsule::connection()->getQueryLog());
+        $categories = Category::orderBy('name')->get();
+
+        $this->assertEquals($queryLogCount + 1, count(Capsule::connection()->getQueryLog()));
+
+        $expectedShape = [
+            'apple (3)}' => 'store (1) > notebooks (2)',
+            'galaxy (8)}' => 'store (1) > mobile (5) > samsung (7)',
+            'lenovo (4)}' => 'store (1) > notebooks (2)',
+            'lenovo (10)}' => 'store (1) > mobile (5)',
+            'mobile (5)}' => 'store (1)',
+            'nokia (6)}' => 'store (1) > mobile (5)',
+            'notebooks (2)}' => 'store (1)',
+            'samsung (7)}' => 'store (1) > mobile (5)',
+            'sony (9)}' => 'store (1) > mobile (5)',
+            'store (1)}' => '',
+            'store_2 (11)}' => ''
+        ];
+
+        $output = [];
+
+        foreach ($categories as $category) {
+            $output["{$category->name} ({$category->id})}"] = $category->ancestors->count()
+                ? implode(' > ', $category->ancestors->map(function ($cat) { return "{$cat->name} ({$cat->id})"; })->toArray())
+                : '';
+        }
+
+        // assert that there is number of original query + 1 + number of rows to fulfill the relation
+        $this->assertEquals($queryLogCount + 12, count(Capsule::connection()->getQueryLog()));
+
+        $this->assertEquals($expectedShape, $output);
+    }
+
+    public function testWhereHasCountQueryForAncestors()
+    {
+        $categories = all(Category::has('ancestors', '>', 2)->pluck('name'));
+
+        $this->assertEquals([ 'galaxy' ], $categories);
+
+        $categories = all(Category::whereHas('ancestors', function ($query) {
+            $query->where('id', 5);
+        })->pluck('name'));
+
+        $this->assertEquals([ 'nokia', 'samsung', 'galaxy', 'sony', 'lenovo' ], $categories);
+    }
+
+    public function testReplication()
+    {
+        $category = $this->findCategory('nokia');
+        $category = $category->replicate();
+        $category->save();
+        $category->refreshNode();
+
+        $this->assertNull($category->getParentId());
+
+        $category = $this->findCategory('nokia');
+        $category = $category->replicate();
+        $category->parent_id = 1;
+        $category->save();
+
+        $category->refreshNode();
+
+        $this->assertEquals(1, $category->getParentId());
+    }
+
 }
 
 function all($items)

@@ -6,7 +6,7 @@
 
 This is a Laravel 4-5 package for working with trees in relational databases.
 
-*   **Laravel 5.2** is supported since v4
+*   **Laravel 5.2, 5.3, 5.4, 5.5** is supported since v4
 *   **Laravel 5.1** is supported in v3
 *   **Laravel 4** is supported in v2
 
@@ -42,7 +42,7 @@ a way to effectively store hierarchical data in a relational table. From wikiped
 ### Applications
 
 NSM shows good performance when tree is updated rarely. It is tuned to be fast for
-getting related nodes. It'is ideally suited for building multi-depth menu or 
+getting related nodes. It'is ideally suited for building multi-depth menu or
 categories for shop.
 
 Documentation
@@ -57,13 +57,15 @@ Node has following relationships that are fully functional and can be eagerly lo
 
 -   Node belongs to `parent`
 -   Node has many `children`
+-   Node has many `ancestors`
 -   Node has many `descendants`
 
 ### Inserting nodes
 
-Moving and inserting nodes includes several database queries, so __transaction is
-automatically started__ when node is saved. It is safe to use global transaction 
-if you work with several models.
+Moving and inserting nodes includes several database queries, so it is
+highly recommended to use transactions.
+
+__IMPORTANT!__ As of v4.2.0 transaction is not automatically started
 
 Another important note is that __structural manipulations are deferred__ until you
 hit `save` on model (some methods implicitly call `save` and return boolean result
@@ -148,7 +150,7 @@ $parent->prependNode($node);
 
 You can make `$node` to be a neighbor of the `$neighbor` node using following methods:
 
-*`$neighbor` must exists, target node can be fresh. If target node exists, 
+*`$neighbor` must exists, target node can be fresh. If target node exists,
 it will be moved to the new position and parent will be changed if it's required.*
 
 ```php
@@ -169,11 +171,11 @@ When using static method `create` on node, it checks whether attributes contains
 ```php
 $node = Category::create([
     'name' => 'Foo',
-    
+
     'children' => [
         [
             'name' => 'Bar',
-            
+
             'children' => [
                 [ 'name' => 'Baz' ],
             ],
@@ -212,46 +214,63 @@ Node `bar` has no primary key specified, so it will be created.
 `$delete` shows whether to delete nodes that are already exists but not present
 in `$data`. By default, nodes aren't deleted.
 
+##### Rebuilding a subtree
+
+As of 4.2.8 you can rebuild a subtree:
+
+```php
+Category::rebuildSubtree($root, $data);
+```
+
+This constraints tree rebuilding to descendants of `$root` node.
+
 ### Retrieving nodes
 
 *In some cases we will use an `$id` variable which is an id of the target node.*
 
-#### Ancestors
+#### Ancestors and descendants
 
 Ancestors make a chain of parents to the node. Helpful for displaying breadcrumbs
 to the current category.
 
-```php
-// #1 Using accessor
-$result = $node->getAncestors();
-
-// #2 Using a query 
-$result = $node->ancestors()->get();
-
-// #3 Getting ancestors by primary key
-$result = Category::ancestorsOf($id);
-```
-
-#### Descendants
-
 Descendants are all nodes in a sub tree, i.e. children of node, children of
 children, etc.
 
+Both ancestors and descendants can be eagerly loaded.
+
 ```php
-// #1 Using relationship
-$result = $node->descendants;
+// Accessing ancestors
+$node->ancestors;
 
-// #2 Using a query
-$result = $node->descendants()->get();
-
-// #3 Getting descendants by primary key
-$result = Category::descendantsOf($id);
+// Accessing descendants
+$node->descendants;
 ```
 
-Descendants can be eagerly loaded:
+It is possible to load ancestors and descendants using custom query:
 
 ```php
-$nodes = Category::with('descendants')->whereIn('id', $idList)->get();
+$result = Category::ancestorsOf($id);
+$result = Category::ancestorsAndSelf($id);
+$result = Category::descendantsOf($id);
+$result = Category::descendantsAndSelf($id);
+```
+
+In most cases, you need your ancestors to be ordered by the level:
+
+```php
+$result = Category::defaultOrder()->ancestorsOf($id);
+```
+
+A collection of ancestors can be eagerly loaded:
+
+```php
+$categories = Category::with('ancestors')->paginate(30);
+
+// in view for breadcrumbs:
+@foreach($categories as $i => $category)
+    <small>{{ $category->ancestors->count() ? implode(' > ', $category->ancestors->pluck('name')->toArray()) : 'Top Level' }}</small><br>
+    {{ $category->name }}
+@endforeach
 ```
 
 #### Siblings
@@ -270,7 +289,7 @@ To get only next siblings:
 // Get a sibling that is immediately after the node
 $result = $node->getNextSibling();
 
-// Get all siblings that are after the node 
+// Get all siblings that are after the node
 $result = $node->getNextSiblings();
 
 // Get all siblings using a query
@@ -283,7 +302,7 @@ To get previous siblings:
 // Get a sibling that is immediately before the node
 $result = $node->getPrevSibling();
 
-// Get all siblings that are before the node 
+// Get all siblings that are before the node
 $result = $node->getPrevSiblings();
 
 // Get all siblings using a query
@@ -297,7 +316,7 @@ How can you get all goods of `$category` and every its descendant? Easy!
 
 ```php
 // Get ids of descendants
-$categories = $category->descendants()->lists('id');
+$categories = $category->descendants()->pluck('id');
 
 // Include the id of category itself
 $categories[] = $category->getKey();
@@ -324,14 +343,20 @@ To get nodes of specified level, you can apply `having` constraint:
 $result = Category::withDepth()->having('depth', '=', 1)->get();
 ```
 
+__IMPORTANT!__ This will not work in database strict mode
+
 #### Default order
 
-Each node has it's own unique `_lft` value that determines its position in the tree. If
-you want node to be ordered by this value, you can use `defaultOrder` method on
-the query builder:
+All nodes are strictly organized internally. By default, no order is
+applied, so nodes may appear in random order and this doesn't affect
+displaying a tree. You can order nodes by alphabet or other index.
+
+But in some cases hierarchical order is essential. It is required for
+retrieving ancestors and can be used to order menu items.
+
+To apply tree order `defaultOrder` method is used:
 
 ```php
-// All nodes will now be ordered by lft value
 $result = Category::defaultOrder()->get();
 ```
 
@@ -340,8 +365,6 @@ You can get nodes in reversed order:
 ```php
 $result = Category::reversed()->get();
 ```
-
-##### Shifting a node
 
 To shift node up or down inside parent to affect default order:
 
@@ -372,12 +395,17 @@ $result = Category::whereDescendantOf($node)->get();
 $result = Category::whereNotDescendantOf($node)->get();
 $result = Category::orWhereDescendantOf($node)->get();
 $result = Category::orWhereNotDescendantOf($node)->get();
+$result = Category::whereDescendantAndSelf($id)->get();
+
+// Include target node into result set
+$result = Category::whereDescendantOrSelf($node)->get();
 ```
 
 Ancestor constraints:
 
 ```php
 $result = Category::whereAncestorOf($node)->get();
+$result = Category::whereAncestorOrSelf($id)->get();
 ```
 
 `$node` can be either a primary key of the model or model instance.
@@ -427,17 +455,27 @@ after parent node. This is helpful when you get nodes with custom order
 $nodes = Category::get()->toFlatTree();
 ```
 
+Previous example will output:
+
+```
+Root
+Child 1
+Sub child 1
+Child 2
+Another root
+```
+
 ##### Getting a subtree
 
 Sometimes you don't need whole tree to be loaded and just some subtree of specific node.
 It is show in following example:
 
 ```php
-$root = Category::find($rootId);
-$tree = $root->descendants->toTree($root);
+$root = Category::descendantsAndSelf($rootId)->toTree()->first();
 ```
 
-Now `$tree` contains children of `$root` node.
+In a single query we are getting a root of a subtree and all of its
+descendants that are accessible via `children` relation.
 
 If you don't need `$root` node itself, do following instead:
 
@@ -484,6 +522,7 @@ Other checks:
 *   `$node->isChildOf($other);`
 *   `$node->isAncestorOf($other);`
 *   `$node->isSiblingOf($other);`
+*   `$node->isLeaf()`
 
 ### Checking consistency
 
@@ -507,10 +546,10 @@ It will return an array with following keys:
     doesn't correspond to `lft` and `rgt` values
 -   `missing_parent` -- the number of nodes that have `parent_id` pointing to
     node that doesn't exists
-    
+
 #### Fixing tree
 
-Since v3.1 tree can now be fixed. Using inheritance info from `parent_id` column, 
+Since v3.1 tree can now be fixed. Using inheritance info from `parent_id` column,
 proper `_lft` and `_rgt` values are set for every node.
 
 ```php
@@ -521,7 +560,7 @@ Node::fixTree();
 
 Imagine you have `Menu` model and `MenuItems`. There is a one-to-many relationship
 set up between these models. `MenuItem` has `menu_id` attribute for joining models
-together. `MenuItem` incorporates nested sets. It is obvious that you would want to 
+together. `MenuItem` incorporates nested sets. It is obvious that you would want to
 process each tree separately based on `menu_id` attribute. In order to do so, you
 need to specify this attribute as scope attribute:
 
@@ -541,7 +580,7 @@ MenuItem::descendantsOf($id)->get(); // WRONG: returns nodes from other scope
 MenuItem::scoped([ 'menu_id' => 5 ])->fixTree();
 ```
 
-When requesting nodes using model instance, scopes applied automatically based 
+When requesting nodes using model instance, scopes applied automatically based
 on the attributes of that model. See examples:
 
 ```php
@@ -556,7 +595,7 @@ To get scoped query builder using instance:
 $node->newScopedQuery();
 ```
 
-Note, that scoping is not required when retrieving model by primary key 
+Note, that scoping is not required when retrieving model by primary key
 (since the key is unique):
 
 ```php
@@ -570,7 +609,7 @@ Requirements
 - PHP >= 5.4
 - Laravel >= 4.1
 
-It is highly suggested to use database that supports transactions (like MySql's InnoDb) 
+It is highly suggested to use database that supports transactions (like MySql's InnoDb)
 to secure a tree from possible corruption.
 
 Installation
@@ -589,6 +628,9 @@ composer require kalnoy/nestedset
 You can use a method to add needed columns with default names:
 
 ```php
+...
+use Kalnoy\Nestedset\NestedSet;
+
 Schema::create('table', function (Blueprint $table) {
     ...
     NestedSet::columns($table);
@@ -598,6 +640,9 @@ Schema::create('table', function (Blueprint $table) {
 To drop columns:
 
 ```php
+...
+use Kalnoy\Nestedset\NestedSet;
+
 Schema::table('table', function (Blueprint $table) {
     NestedSet::dropColumns($table);
 });
@@ -654,7 +699,7 @@ $table->unsignedInteger('_lft');
 $table->unsignedInteger('_rgt');
 ```
 
-After [setting up your model](#the-model) you only need to fix the tree to fill 
+After [setting up your model](#the-model) you only need to fix the tree to fill
 `_lft` and `_rgt` columns:
 
 ```php
@@ -664,7 +709,7 @@ MyModel::fixTree();
 License
 =======
 
-Copyright (c) 2016 Alexander Kalnoy
+Copyright (c) 2017 Alexander Kalnoy
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

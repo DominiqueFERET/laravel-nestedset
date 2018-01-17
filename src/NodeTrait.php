@@ -7,10 +7,7 @@ use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\SoftDeletingScope;
-use Illuminate\Database\Query\Builder;
 use LogicException;
-use MongoDB\Driver\Query;
 
 trait NodeTrait
 {
@@ -46,39 +43,25 @@ trait NodeTrait
     public static function bootNodeTrait()
     {
         static::saving(function ($model) {
-            $model->getConnection()->beginTransaction();
-
             return $model->callPendingAction();
         });
 
-        static::saved(function ($model) {
-            $model->getConnection()->commit();
-        });
-
         static::deleting(function ($model) {
-            $model->getConnection()->beginTransaction();
-
             // We will need fresh data to delete node safely
             $model->refreshNode();
         });
 
         static::deleted(function ($model) {
             $model->deleteDescendants();
-
-            $model->getConnection()->commit();
         });
 
         if (static::usesSoftDelete()) {
             static::restoring(function ($model) {
-                $model->getConnection()->beginTransaction();
-
                 static::$deletedAt = $model->{$model->getDeletedAtColumn()};
             });
 
             static::restored(function ($model) {
                 $model->restoreDescendants(static::$deletedAt);
-
-                $model->getConnection()->commit();
             });
         }
     }
@@ -99,8 +82,6 @@ trait NodeTrait
 
     /**
      * Call pending action.
-     *
-     * @return null|false
      */
     protected function callPendingAction()
     {
@@ -159,11 +140,6 @@ trait NodeTrait
             return true;
         }
 
-        if ($this->isRoot()) return false;
-
-        // Reset parent object
-        $this->setParent(null);
-
         return $this->insertAt($this->getLowerBound() + 1);
     }
 
@@ -209,8 +185,8 @@ trait NodeTrait
      */
     protected function setParent($value)
     {
-        $this->setParentId( $value ? $value->getKey() : null)
-             ->setRelation('parent', $value);
+        $this->setParentId($value ? $value->getKey() : null)
+            ->setRelation('parent', $value);
 
         return $this;
     }
@@ -251,7 +227,7 @@ trait NodeTrait
     public function parent()
     {
         return $this->belongsTo(get_class($this), $this->getParentIdName())
-                    ->setModel($this);
+            ->setModel($this);
     }
 
     /**
@@ -262,7 +238,7 @@ trait NodeTrait
     public function children()
     {
         return $this->hasMany(get_class($this), $this->getParentIdName())
-                    ->setModel($this);
+            ->setModel($this);
     }
 
     /**
@@ -283,11 +259,11 @@ trait NodeTrait
     public function siblings()
     {
         return $this->newScopedQuery()
-                    ->where($this->getKeyName(), '<>', $this->getKey())
-                    ->where($this->getParentIdName(), '=', $this->getParentId());
+            ->where($this->getKeyName(), '<>', $this->getKey())
+            ->where($this->getParentIdName(), '=', $this->getParentId());
     }
 
-   /**
+    /**
      * Get the node siblings and the node itself.
      *
      * @return \Kalnoy\Nestedset\QueryBuilder
@@ -295,13 +271,13 @@ trait NodeTrait
     public function siblingsAndSelf()
     {
         return $this->newScopedQuery()
-                    ->where($this->getParentIdName(), '=', $this->getParentId());
+            ->where($this->getParentIdName(), '=', $this->getParentId());
     }
 
     /**
      * Get query for the node siblings and the node itself.
      *
-     * @param  array  $columns
+     * @param  array $columns
      *
      * @return \Illuminate\Database\Eloquent\Collection
      */
@@ -318,7 +294,7 @@ trait NodeTrait
     public function nextSiblings()
     {
         return $this->nextNodes()
-                    ->where($this->getParentIdName(), '=', $this->getParentId());
+            ->where($this->getParentIdName(), '=', $this->getParentId());
     }
 
     /**
@@ -329,7 +305,7 @@ trait NodeTrait
     public function prevSiblings()
     {
         return $this->prevNodes()
-                    ->where($this->getParentIdName(), '=', $this->getParentId());
+            ->where($this->getParentIdName(), '=', $this->getParentId());
     }
 
     /**
@@ -340,7 +316,7 @@ trait NodeTrait
     public function nextNodes()
     {
         return $this->newScopedQuery()
-                    ->where($this->getLftName(), '>', $this->getLft());
+            ->where($this->getLftName(), '>', $this->getLft());
     }
 
     /**
@@ -351,19 +327,17 @@ trait NodeTrait
     public function prevNodes()
     {
         return $this->newScopedQuery()
-                    ->where($this->getLftName(), '<', $this->getLft());
+            ->where($this->getLftName(), '<', $this->getLft());
     }
 
     /**
-     * Get query for ancestors to the node not including the node itself.
+     * Get query ancestors of the node.
      *
-     * @return  QueryBuilder
+     * @return  AncestorsRelation
      */
     public function ancestors()
     {
-        return $this->newScopedQuery()
-                    ->whereAncestorOf($this)
-                    ->defaultOrder();
+        return new AncestorsRelation($this->newScopedQuery(), $this);
     }
 
     /**
@@ -373,6 +347,8 @@ trait NodeTrait
      */
     public function makeRoot()
     {
+        $this->setParent(null)->dirtyBounds();
+
         return $this->setNodeAction('root');
     }
 
@@ -384,7 +360,7 @@ trait NodeTrait
     public function saveAsRoot()
     {
         if ($this->exists && $this->isRoot()) {
-            return true;
+            return $this->save();
         }
 
         return $this->makeRoot()->save();
@@ -447,7 +423,8 @@ trait NodeTrait
     public function appendOrPrependTo(self $parent, $prepend = false)
     {
         $this->assertNodeExists($parent)
-             ->assertNotDescendant($parent);
+            ->assertNotDescendant($parent)
+            ->assertSameScope($parent);
 
         $this->setParent($parent)->dirtyBounds();
 
@@ -486,7 +463,9 @@ trait NodeTrait
      */
     public function beforeOrAfterNode(self $node, $after = false)
     {
-        $this->assertNodeExists($node)->assertNotDescendant($node);
+        $this->assertNodeExists($node)
+            ->assertNotDescendant($node)
+            ->assertSameScope($node);
 
         if ( ! $this->isSiblingOf($node)) {
             $this->setParent($node->getRelationValue('parent'));
@@ -550,9 +529,9 @@ trait NodeTrait
     public function up($amount = 1)
     {
         $sibling = $this->prevSiblings()
-                        ->defaultOrder('desc')
-                        ->skip($amount - 1)
-                        ->first();
+            ->defaultOrder('desc')
+            ->skip($amount - 1)
+            ->first();
 
         if ( ! $sibling) return false;
 
@@ -569,9 +548,9 @@ trait NodeTrait
     public function down($amount = 1)
     {
         $sibling = $this->nextSiblings()
-                        ->defaultOrder()
-                        ->skip($amount - 1)
-                        ->first();
+            ->defaultOrder()
+            ->skip($amount - 1)
+            ->first();
 
         if ( ! $sibling) return false;
 
@@ -608,7 +587,7 @@ trait NodeTrait
     protected function moveNode($position)
     {
         $updated = $this->newNestedSetQuery()
-                        ->moveNode($this->getKey(), $position) > 0;
+                ->moveNode($this->getKey(), $position) > 0;
 
         if ($updated) $this->refreshNode();
 
@@ -670,8 +649,8 @@ trait NodeTrait
     protected function restoreDescendants($deletedAt)
     {
         $this->descendants()
-             ->where($this->getDeletedAtColumn(), '>=', $deletedAt)
-             ->restore();
+            ->where($this->getDeletedAtColumn(), '>=', $deletedAt)
+            ->restore();
     }
 
     /**
@@ -792,6 +771,8 @@ trait NodeTrait
             $child->setRelation('parent', $instance);
         }
 
+        $instance->refreshNode();
+
         return $instance->setRelation('children', $relation);
     }
 
@@ -845,6 +826,14 @@ trait NodeTrait
     public function isRoot()
     {
         return is_null($this->getParentId());
+    }
+
+    /**
+     * @return bool
+     */
+    public function isLeaf()
+    {
+        return $this->getLft() + 1 == $this->getRgt();
     }
 
     /**
@@ -942,9 +931,7 @@ trait NodeTrait
      */
     public function getAncestors(array $columns = [ '*' ])
     {
-        return $this->newScopedQuery()
-                    ->defaultOrder()
-                    ->ancestorsOf($this, $columns);
+        return $this->ancestors()->get($columns);
     }
 
     /**
@@ -1017,7 +1004,20 @@ trait NodeTrait
     public function isDescendantOf(self $other)
     {
         return $this->getLft() > $other->getLft() &&
-               $this->getLft() < $other->getRgt();
+            $this->getLft() < $other->getRgt();
+    }
+
+    /**
+     * Get whether a node is itself or a descendant of other node.
+     *
+     * @param self $other
+     *
+     * @return bool
+     */
+    public function isSelfOrDescendantOf(self $other)
+    {
+        return $this->getLft() >= $other->getLft() &&
+            $this->getLft() < $other->getRgt();
     }
 
     /**
@@ -1054,6 +1054,18 @@ trait NodeTrait
     public function isAncestorOf(self $other)
     {
         return $other->isDescendantOf($this);
+    }
+
+    /**
+     * Get whether the node is itself or an ancestor of other node, including immediate parent.
+     *
+     * @param self $other
+     *
+     * @return bool
+     */
+    public function isSelfOrAncestorOf(self $other)
+    {
+        return $other->isSelfOrDescendantOf($this);
     }
 
     /**
@@ -1138,11 +1150,14 @@ trait NodeTrait
      */
     protected function dirtyBounds()
     {
-        return $this->setLft(null)->setRgt(null);
+        $this->original[$this->getLftName()] = null;
+        $this->original[$this->getRgtName()] = null;
+
+        return $this;
     }
 
     /**
-     * @param NodeTrait $node
+     * @param self $node
      *
      * @return $this
      */
@@ -1156,7 +1171,7 @@ trait NodeTrait
     }
 
     /**
-     * @param NodeTrait $node
+     * @param self $node
      *
      * @return $this
      */
@@ -1169,4 +1184,37 @@ trait NodeTrait
         return $this;
     }
 
+    /**
+     * @param self $node
+     */
+    protected function assertSameScope(self $node)
+    {
+        if ( ! $scoped = $this->getScopeAttributes()) {
+            return;
+        }
+
+        foreach ($scoped as $attr) {
+            if ($this->getAttribute($attr) != $node->getAttribute($attr)) {
+                throw new LogicException('Nodes must be in the same scope');
+            }
+        }
+    }
+
+    /**
+     * @param array|null $except
+     *
+     * @return \Illuminate\Database\Eloquent\Model
+     */
+    public function replicate(array $except = null)
+    {
+        $defaults = [
+            $this->getParentIdName(),
+            $this->getLftName(),
+            $this->getRgtName(),
+        ];
+
+        $except = $except ? array_unique(array_merge($except, $defaults)) : $defaults;
+
+        return parent::replicate($except);
+    }
 }

@@ -1,3 +1,29 @@
+### 4.2.8
+*   Support Laravel 5.5
+*   Added `fixSubtree` and `rebuildSubtree` methods
+*   Increased performance of tree rebuilding
+
+### 4.2.7
+
+*   #217: parent_id, lft and rgt are reset when replicating a node
+
+### 4.2.5
+
+*   #208: dirty parent and bounds when making a root
+*   #206: fixed where has on descendants
+*   refactored ancestors and descendants relations
+
+### 4.2.4
+
+*   Fixed issues related to rebuilding tree when using `SoftDeletes` and scoping
+
+### 4.2.3
+
+*   Added `whereAncestorOrSelf`, `ancestorsAndSelf`, `descendantsOrSelf`,
+    `whereDescendantOrSelf` helper methods
+*   #186: rebuild tree removes nodes softly when model uses SoftDeletes trait
+*   #191: added `whereIsLeaf` and `leaves` method, added `isLeaf` check on node
+
 ### 4.1.0
 
 *   #75: Converted to trait. Following methods were renamed:
@@ -21,7 +47,7 @@
 
 ### 3.1.1
 
-*   Fixed #42: model becomes dirty before save when parent is changed and using `appendTo`, 
+*   Fixed #42: model becomes dirty before save when parent is changed and using `appendTo`,
     `prependTo`, `insertBefore`, `insertAfter`.
 
 ### 3.1.0
