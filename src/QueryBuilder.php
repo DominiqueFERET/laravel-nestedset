@@ -86,7 +86,7 @@ class QueryBuilder extends Builder
      */
     public function whereAncestorOf($id, $andSelf = false, $boolean = 'and')
     {
-        $keyName = $this->model->getKeyName();
+        $keyName = $this->model->getTable() . '.' . $this->model->getKeyName();
 
         if (NestedSet::isNode($id)) {
             $value = '?';
@@ -100,7 +100,7 @@ class QueryBuilder extends Builder
                 ->toBase()
                 ->select("_.".$this->model->getRgtName())
                 ->from($this->model->getTable().' as _')
-                ->where($keyName, '=', $id)
+                ->where($this->model->getKeyName(), '=', $id)
                 ->limit(1);
 
             $this->query->mergeBindings($valueQuery);
@@ -108,13 +108,13 @@ class QueryBuilder extends Builder
             $value = '('.$valueQuery->toSql().')';
         }
 
-        $this->query->whereNested(function ($inner) use ($value, $andSelf, $id) {
+        $this->query->whereNested(function ($inner) use ($value, $andSelf, $id, $keyName) {
             list($lft, $rgt) = $this->wrappedColumns();
 
             $inner->whereRaw("{$value} between {$lft} and {$rgt}");
 
             if ( ! $andSelf) {
-                $inner->where($this->model->getKeyName(), '<>', $id);
+                $inner->where($keyName, '<>', $id);
             }
         }, $boolean);
 
@@ -715,6 +715,7 @@ class QueryBuilder extends Builder
     protected function getDuplicatesQuery()
     {
         $table = $this->wrappedTable();
+        $keyName = $this->wrappedKey();
 
         $firstAlias = 'c1';
         $secondAlias = 'c2';
@@ -726,7 +727,7 @@ class QueryBuilder extends Builder
             ->newNestedSetQuery($firstAlias)
             ->toBase()
             ->from($this->query->raw("{$table} as {$waFirst}, {$table} {$waSecond}"))
-            ->whereRaw("{$waFirst}.id < {$waSecond}.id")
+            ->whereRaw("{$waFirst}.{$keyName} < {$waSecond}.{$keyName}")
             ->whereNested(function (BaseQueryBuilder $inner) use ($waFirst, $waSecond) {
                 list($lft, $rgt) = $this->wrappedColumns();
 
@@ -841,9 +842,11 @@ class QueryBuilder extends Builder
      *
      * Nodes with invalid parent are saved as roots.
      *
-     * @return int The number of fixed nodes
+     * @param null|NodeTrait|Model $root
+     *
+     * @return int The number of changed nodes
      */
-    public function fixTree()
+    public function fixTree($root = null)
     {
         $columns = [
             $this->model->getKeyName(),
@@ -852,25 +855,44 @@ class QueryBuilder extends Builder
             $this->model->getRgtName(),
         ];
 
-        $dictionary = $this->model->newNestedSetQuery()
-                           ->defaultOrder()
-                           ->get($columns)
-                           ->groupBy($this->model->getParentIdName())
-                           ->all();
+        $dictionary = $this->model
+            ->newNestedSetQuery()
+            ->when($root, function (self $query) use ($root) {
+                return $query->whereDescendantOf($root);
+            })
+            ->defaultOrder()
+            ->get($columns)
+            ->groupBy($this->model->getParentIdName())
+            ->all();
 
-        return self::fixNodes($dictionary);
+        return $this->fixNodes($dictionary, $root);
+    }
+
+    /**
+     * @param NodeTrait|Model $root
+     *
+     * @return int
+     */
+    public function fixSubtree($root)
+    {
+        return $this->fixTree($root);
     }
 
     /**
      * @param array $dictionary
+     * @param NodeTrait|Model|null $parent
      *
      * @return int
      */
-    protected static function fixNodes(array &$dictionary)
+    protected function fixNodes(array &$dictionary, $parent = null)
     {
-        $fixed = 0;
+        $parentId = $parent ? $parent->getKey() : null;
+        $cut = $parent ? $parent->getLft() + 1 : 1;
 
-        $cut = self::reorderNodes($dictionary, $fixed);
+        $updated = [];
+        $moved = 0;
+
+        $cut = self::reorderNodes($dictionary, $updated, $parentId, $cut);
 
         // Save nodes that have invalid parent as roots
         while ( ! empty($dictionary)) {
@@ -878,22 +900,33 @@ class QueryBuilder extends Builder
 
             unset($dictionary[key($dictionary)]);
 
-            $cut = self::reorderNodes($dictionary, $fixed, null, $cut);
+            $cut = self::reorderNodes($dictionary, $updated, $parentId, $cut);
         }
 
-        return $fixed;
+        if ($parent && ($grown = $cut - $parent->getRgt()) != 0) {
+            $moved = $this->model->newScopedQuery()->makeGap($parent->getRgt() + 1, $grown);
+
+            $updated[] = $parent->rawNode($parent->getLft(), $cut, $parent->getParentId());
+        }
+
+        foreach ($updated as $model) {
+            $model->save();
+        }
+
+        return count($updated) + $moved;
     }
 
     /**
      * @param array $dictionary
-     * @param int $fixed
+     * @param array $updated
      * @param $parentId
      * @param int $cut
      *
      * @return int
+     * @internal param int $fixed
      */
-    protected static function reorderNodes(array &$dictionary, &$fixed,
-                                           $parentId = null, $cut = 1
+    protected static function reorderNodes(
+        array &$dictionary, array &$updated, $parentId = null, $cut = 1
     ) {
         if ( ! isset($dictionary[$parentId])) {
             return $cut;
@@ -903,17 +936,10 @@ class QueryBuilder extends Builder
         foreach ($dictionary[$parentId] as $model) {
             $lft = $cut;
 
-            $cut = self::reorderNodes($dictionary,
-                                      $fixed,
-                                      $model->getKey(),
-                                      $cut + 1);
+            $cut = self::reorderNodes($dictionary, $updated, $model->getKey(), $cut + 1);
 
-            $rgt = $cut;
-
-            if ($model->rawNode($lft, $rgt, $parentId)->isDirty()) {
-                $model->save();
-
-                $fixed++;
+            if ($model->rawNode($lft, $cut, $parentId)->isDirty()) {
+                $updated[] = $model;
             }
 
             ++$cut;
@@ -932,20 +958,29 @@ class QueryBuilder extends Builder
      * @param array $data
      * @param bool $delete Whether to delete nodes that exists but not in the data
      *                     array
+     * @param null $root
      *
      * @return int
      */
-    public function rebuildTree(array $data, $delete = false)
+    public function rebuildTree(array $data, $delete = false, $root = null)
     {
         if ($this->model->usesSoftDelete()) {
             $this->withTrashed();
         }
 
-        $existing = $this->get()->getDictionary();
+        $existing = $this
+            ->when($root, function (self $query) use ($root) {
+                return $query->whereDescendantOf($root);
+            })
+            ->get()
+            ->getDictionary();
+
         $dictionary = [];
+        $parentId = $root ? $root->getKey() : null;
 
-        $this->buildRebuildDictionary($dictionary, $data, $existing);
+        $this->buildRebuildDictionary($dictionary, $data, $existing, $parentId);
 
+        /** @var Model|NodeTrait $model */
         if ( ! empty($existing)) {
             if ($delete && ! $this->model->usesSoftDelete()) {
                 $this->model
@@ -967,7 +1002,19 @@ class QueryBuilder extends Builder
             }
         }
 
-        return $this->fixNodes($dictionary);
+        return $this->fixNodes($dictionary, $root);
+    }
+
+    /**
+     * @param $root
+     * @param array $data
+     * @param bool $delete
+     *
+     * @return int
+     */
+    public function rebuildSubtree($root, array $data, $delete = false)
+    {
+        return $this->rebuildTree($data, $delete, $root);
     }
 
     /**
@@ -984,10 +1031,12 @@ class QueryBuilder extends Builder
         $keyName = $this->model->getKeyName();
 
         foreach ($data as $itemData) {
+            /** @var NodeTrait|Model $model */
+
             if ( ! isset($itemData[$keyName])) {
                 $model = $this->model->newInstance($this->model->getAttributes());
 
-                // We will save it as raw node since tree will be fixed
+                // Set some values that will be fixed later
                 $model->rawNode(0, 0, $parentId);
             } else {
                 if ( ! isset($existing[$key = $itemData[$keyName]])) {
@@ -995,6 +1044,9 @@ class QueryBuilder extends Builder
                 }
 
                 $model = $existing[$key];
+
+                // Disable any tree actions
+                $model->rawNode($model->getLft(), $model->getRgt(), $parentId);
 
                 unset($existing[$key]);
             }
